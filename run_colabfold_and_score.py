@@ -32,6 +32,9 @@ import numpy as np
 import pyrosetta
 from pyrosetta import rosetta
 
+import re
+from glob import glob
+
 # ---------- CONFIG ----------
 
 # Where your per-backbone design FASTAs live (24 *_designs.fa files)
@@ -44,7 +47,7 @@ AF2_INPUT_DIR = Path("af2_inputs")
 AF2_OUTPUT_DIR = Path("af2_outputs")
 
 # How many models ColabFold runs (5 = standard AF2 ensemble)
-NUM_MODELS = 5
+NUM_MODELS = 1
 
 # Batch size for ColabFold (controls GPU memory usage)
 COLABFOLD_BATCH_SIZE = 3
@@ -112,7 +115,7 @@ def make_af2_input_fastas() -> List[Tuple[Path, str, str]]:
         for header, seq in read_fasta(fa):
             seq_idx += 1
             seq_id = f"{backbone_name}_seq{seq_idx:03d}"
-            out_path = AF2_INPUT_DIR / f"{seq_id}.fa"
+            out_path = AF2_INPUT_DIR / f"{seq_id}.fasta"
             with open(out_path, "w") as out_f:
                 out_f.write(f">{seq_id}\n{seq}\n")
             per_seq_fastas.append((out_path, backbone_name, seq_id))
@@ -139,9 +142,10 @@ def run_colabfold_batch():
     cmd = [
         "colabfold_batch",
         "--num-models", str(NUM_MODELS),
-        "--batch-size", str(COLABFOLD_BATCH_SIZE),
-        "--use-templates", "false",
-        "--rank-by", "plddt",
+        # "--batch-size", str(COLABFOLD_BATCH_SIZE),
+        # "--use-templates", "false",
+        "--num-recycle", "1",
+        "--rank", "plddt",
         str(AF2_INPUT_DIR),
         str(AF2_OUTPUT_DIR),
     ]
@@ -234,39 +238,65 @@ def find_ideal_backbone(backbone_name: str) -> Path:
 
 # ---------- PARSE COLABFOLD OUTPUTS & SCORE ----------
 
+def sanitize_name_for_colabfold(name: str) -> str:
+    """
+    Approximate the same sanitization ColabFold uses for filenames:
+    replace any non [0-9A-Za-z_.-] character by '_'.
+    """
+    return re.sub(r"[^0-9A-Za-z_.-]", "_", name)
+
 def parse_single_result(seq_id: str, backbone_name: str) -> Dict[str, object]:
     """
     Parse ColabFold outputs for a sequence with given seq_id.
 
-    ColabFold creates files like:
-      seq_id_unrelaxed_rank_1_model_1.pdb
-      seq_id_relaxed_rank_1_model_1.pdb  (if relaxation enabled)
-      seq_id_scores_rank_001.json or seq_id_scores.json
+    Handles both older ColabFold names like:
+      seq_id_scores_rank_001.json
       seq_id_pae.json
+      seq_id_unrelaxed_rank_1_model_1.pdb
+
+    and newer ones like:
+      seq_id_scores_rank_001_alphafold2_ptm_model_1_seed_000.json
+      seq_id_predicted_aligned_error_v1.json
+      seq_id_unrelaxed_rank_001_alphafold2_ptm_model_1_seed_000.pdb
     """
-    # scores JSON
-    scores_json = None
-    for pattern in [f"{seq_id}_scores_rank_001.json",
-                    f"{seq_id}_scores.json"]:
-        cand = AF2_OUTPUT_DIR / pattern
-        if cand.exists():
-            scores_json = cand
-            break
+    # candidate base names: raw and sanitized
+    base_ids = [seq_id]
+    sanitized = sanitize_name_for_colabfold(seq_id)
+    if sanitized not in base_ids:
+        base_ids.append(sanitized)
+
+    def first_match(patterns: List[str]) -> Optional[Path]:
+        for base in base_ids:
+            for pat in patterns:
+                # pat should start with '_' and may contain wildcards
+                full_pat = str(AF2_OUTPUT_DIR / f"{base}{pat}")
+                hits = sorted(glob(full_pat))
+                if hits:
+                    return Path(hits[0])
+        return None
+
+    # ---- scores JSON ----
+    scores_json = first_match([
+        "_scores_rank_001*.json",
+        "_scores*.json",
+    ])
     if scores_json is None:
         raise FileNotFoundError(f"No scores JSON found for {seq_id} in {AF2_OUTPUT_DIR}")
 
     with open(scores_json) as f:
         scores = json.load(f)
 
-    # ColabFold's scores.json usually has keys like:
-    #   'plddt': [list], 'ptm', 'iptm', 'ranking_confidence'
+    # pLDDT
     plddt = np.array(scores.get("plddt", []), dtype=float)
     mean_plddt = float(plddt.mean()) if plddt.size else float("nan")
 
-    # PAE JSON
-    pae_json = AF2_OUTPUT_DIR / f"{seq_id}_pae.json"
+    # ---- PAE JSON ----
+    pae_json = first_match([
+        "_pae*.json",
+        "_predicted_aligned_error*.json",
+    ])
     mean_pae = float("nan")
-    if pae_json.exists():
+    if pae_json is not None and pae_json.exists():
         with open(pae_json) as f:
             pae_dict = json.load(f)
         # 'pae' key is typically a list-of-lists matrix
@@ -278,16 +308,13 @@ def parse_single_result(seq_id: str, backbone_name: str) -> Dict[str, object]:
 
     ranking_conf = float(scores.get("ranking_confidence", float("nan")))
 
-    # Best PDB: prefer relaxed rank_1, then unrelaxed rank_1
-    best_pdb = None
-    for pattern in [
-        f"{seq_id}_relaxed_rank_1_model_1.pdb",
-        f"{seq_id}_unrelaxed_rank_1_model_1.pdb",
-    ]:
-        cand = AF2_OUTPUT_DIR / pattern
-        if cand.exists():
-            best_pdb = cand
-            break
+    # ---- best PDB (rank 1) ----
+    best_pdb = first_match([
+        "_relaxed_rank_1*.pdb",
+        "_relaxed_rank_001*.pdb",
+        "_unrelaxed_rank_1*.pdb",
+        "_unrelaxed_rank_001*.pdb",
+    ])
     if best_pdb is None:
         raise FileNotFoundError(f"No rank_1 PDB found for {seq_id} in {AF2_OUTPUT_DIR}")
 
@@ -302,7 +329,7 @@ def parse_single_result(seq_id: str, backbone_name: str) -> Dict[str, object]:
     motif_ranges = (MOTIF_RANGES.get(backbone_name)
                     or MOTIF_RANGES.get(ideal_pdb.stem))
     if motif_ranges:
-        motif_r = rmsd_for_ranges(ideal_pose, pred_pose, motif_ranges)
+        motif_r = rmsd_over_motif_ranges(ideal_pose, pred_pose, motif_ranges)
 
     return {
         "seq_id": seq_id,
@@ -311,9 +338,9 @@ def parse_single_result(seq_id: str, backbone_name: str) -> Dict[str, object]:
         "best_pdb": str(best_pdb),
         "ranking_confidence": ranking_conf,
         "mean_plddt": mean_plddt,
-        "mean_pae_offdiag": mean_pae,
-        "ca_rmsd_to_ideal": float(ca),
-        "tm_score_to_ideal": tm,
+        "mean_pae_offdiag": mean_pae,       
+        "ca_rmsd_to_ideal": float(ca),      
+        "tm_score_to_ideal": tm,            
         "motif_ca_rmsd": motif_r,
     }
 
@@ -351,7 +378,7 @@ def collect_all_metrics(per_seq_fastas: List[Tuple[Path, str, str]]):
 
 def main():
     per_seq_fastas = make_af2_input_fastas()
-    run_colabfold_batch()
+    # run_colabfold_batch()
     collect_all_metrics(per_seq_fastas)
 
 
