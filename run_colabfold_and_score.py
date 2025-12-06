@@ -249,36 +249,35 @@ def parse_single_result(seq_id: str, backbone_name: str) -> Dict[str, object]:
     """
     Parse ColabFold outputs for a sequence with given seq_id.
 
-    Handles both older ColabFold names like:
-      seq_id_scores_rank_001.json
-      seq_id_pae.json
-      seq_id_unrelaxed_rank_1_model_1.pdb
-
-    and newer ones like:
-      seq_id_scores_rank_001_alphafold2_ptm_model_1_seed_000.json
-      seq_id_predicted_aligned_error_v1.json
-      seq_id_unrelaxed_rank_001_alphafold2_ptm_model_1_seed_000.pdb
+    Compatible with ColabFold 1.5+ filenames like:
+      <seq_id>_scores_rank_001_alphafold2_ptm_model_1_seed_000.json
+      <seq_id>_predicted_aligned_error_v1.json
+      <seq_id>_unrelaxed_rank_001_alphafold2_ptm_model_1_seed_000.pdb
     """
-    # candidate base names: raw and sanitized
-    base_ids = [seq_id]
-    sanitized = sanitize_name_for_colabfold(seq_id)
-    if sanitized not in base_ids:
-        base_ids.append(sanitized)
 
-    def first_match(patterns: List[str]) -> Optional[Path]:
+    # ColabFold sanitizes names: anything not alnum/._- becomes "_"
+    def sanitize(name: str) -> str:
+        return re.sub(r"[^0-9A-Za-z_.-]", "_", name)
+
+    base_ids = [seq_id]
+    san = sanitize(seq_id)
+    if san not in base_ids:
+        base_ids.append(san)
+
+    def first_match(suffix_patterns) -> Optional[Path]:
+        """Try base_ids + each suffix glob; return first existing Path or None."""
         for base in base_ids:
-            for pat in patterns:
-                # pat should start with '_' and may contain wildcards
-                full_pat = str(AF2_OUTPUT_DIR / f"{base}{pat}")
-                hits = sorted(glob(full_pat))
+            for suff in suffix_patterns:
+                pattern = str(AF2_OUTPUT_DIR / f"{base}{suff}")
+                hits = sorted(glob(pattern))
                 if hits:
                     return Path(hits[0])
         return None
 
-    # ---- scores JSON ----
+    # ---------- scores JSON ----------
     scores_json = first_match([
-        "_scores_rank_001*.json",
-        "_scores*.json",
+        "_scores_rank_001*.json",   # new ColabFold style
+        "_scores*.json",            # fallback
     ])
     if scores_json is None:
         raise FileNotFoundError(f"No scores JSON found for {seq_id} in {AF2_OUTPUT_DIR}")
@@ -286,50 +285,65 @@ def parse_single_result(seq_id: str, backbone_name: str) -> Dict[str, object]:
     with open(scores_json) as f:
         scores = json.load(f)
 
-    # pLDDT
+    # pLDDT (vector) -> mean
     plddt = np.array(scores.get("plddt", []), dtype=float)
     mean_plddt = float(plddt.mean()) if plddt.size else float("nan")
 
-    # ---- PAE JSON ----
+    # ranking confidence (if present)
+    ranking_conf = scores.get("ranking_confidence", None)
+    ranking_conf = float(ranking_conf) if ranking_conf is not None else float("nan")
+
+    # ---------- PAE ----------
     pae_json = first_match([
-        "_pae*.json",
         "_predicted_aligned_error*.json",
+        "_pae*.json",
     ])
     mean_pae = float("nan")
     if pae_json is not None and pae_json.exists():
         with open(pae_json) as f:
             pae_dict = json.load(f)
-        # 'pae' key is typically a list-of-lists matrix
-        pae = np.array(pae_dict.get("pae", []), dtype=float)
+
+        # ColabFold sometimes stores under "pae", sometimes under "predicted_aligned_error"
+        if "pae" in pae_dict:
+            pae = np.array(pae_dict["pae"], dtype=float)
+        elif "predicted_aligned_error" in pae_dict:
+            pae = np.array(pae_dict["predicted_aligned_error"], dtype=float)
+        else:
+            pae = np.array([])
+
         if pae.size:
             L = pae.shape[0]
-            mask = ~np.eye(L, dtype=bool)
+            mask = ~np.eye(L, dtype=bool)  # off-diagonal only
             mean_pae = float(pae[mask].mean())
 
-    ranking_conf = float(scores.get("ranking_confidence", float("nan")))
-
-    # ---- best PDB (rank 1) ----
+    # ---------- rank-1 PDB ----------
     best_pdb = first_match([
-        "_relaxed_rank_1*.pdb",
-        "_relaxed_rank_001*.pdb",
-        "_unrelaxed_rank_1*.pdb",
         "_unrelaxed_rank_001*.pdb",
+        "_unrelaxed_rank_1*.pdb",
+        "_relaxed_rank_001*.pdb",
+        "_relaxed_rank_1*.pdb",
     ])
     if best_pdb is None:
         raise FileNotFoundError(f"No rank_1 PDB found for {seq_id} in {AF2_OUTPUT_DIR}")
 
+    # Ideal backbone
     ideal_pdb = find_ideal_backbone(backbone_name)
     ideal_pose = load_pose(ideal_pdb)
     pred_pose = load_pose(best_pdb)
 
-    ca = ca_rmsd(ideal_pose, pred_pose)
-    tm = tm_score(ideal_pdb, best_pdb)
+    # Cα RMSD
+    ca = float(ca_rmsd(ideal_pose, pred_pose))
 
-    motif_r = float("nan")
-    motif_ranges = (MOTIF_RANGES.get(backbone_name)
-                    or MOTIF_RANGES.get(ideal_pdb.stem))
+    # TM-score: may be None if TM-align not configured → write NaN instead
+    tm_val = tm_score(ideal_pdb, best_pdb)
+    tm = float(tm_val) if tm_val is not None else float("nan")
+
+    # Motif RMSD if motif ranges defined for this backbone
+    motif_ranges = MOTIF_RANGES.get(backbone_name) or MOTIF_RANGES.get(ideal_pdb.stem)
     if motif_ranges:
-        motif_r = rmsd_over_motif_ranges(ideal_pose, pred_pose, motif_ranges)
+        motif_r = rmsd_for_ranges(ideal_pose, pred_pose, motif_ranges)
+    else:
+        motif_r = float("nan")
 
     return {
         "seq_id": seq_id,
@@ -338,12 +352,11 @@ def parse_single_result(seq_id: str, backbone_name: str) -> Dict[str, object]:
         "best_pdb": str(best_pdb),
         "ranking_confidence": ranking_conf,
         "mean_plddt": mean_plddt,
-        "mean_pae_offdiag": mean_pae,       
-        "ca_rmsd_to_ideal": float(ca),      
-        "tm_score_to_ideal": tm,            
+        "mean_pae_offdiag": mean_pae,
+        "ca_rmsd_to_ideal": ca,
+        "tm_score_to_ideal": tm,
         "motif_ca_rmsd": motif_r,
     }
-
 
 def collect_all_metrics(per_seq_fastas: List[Tuple[Path, str, str]]):
     rows = []
